@@ -1,0 +1,160 @@
+---
+title: "Hywind Scotland - GPS and WBT calibration processing"
+author: "[Pierre Priou](ppr@akvaplan.niva.no)"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+---
+
+This document contains the code that extracts GPS fixes for the Sailbuoy which surveyed Hywind Scotland.
+
+# Packages required
+
+```{r load-packages, message=FALSE}
+library(tidyverse)                    # Tidy code
+library(XML)                          # Parse xml to dataframe
+library(xml2)                         # Read xml
+source("R/functions/EV_gps_csv.R")    # Format GPS data to be read by Echoview
+source("R/functions/EV_update_ecs.R") # Update ecs file
+```
+
+Load coastline shapefile.
+
+```{r coastline, warning=FALSE}
+# Coastlines
+coast <- rgdal::readOGR("data/bathy/ne_10m_land.shp", verbose = F) %>%
+  # Convert to dataframe
+  fortify() %>%
+  rename(lon = long,
+         region = id)
+```
+
+Set figure theme.
+
+```{r update-fig-theme}
+# Theme for figures
+theme_set(theme_bw())
+theme_update(panel.grid = element_blank(), 
+             panel.border = element_blank(), 
+             axis.line = element_line(),
+             axis.text = element_text(size = 8),
+             axis.title = element_text(size = 9),
+             legend.title = element_text(size = 9),
+             strip.text.x = element_text(size = 8, face = "plain", hjust = 0.5),
+             strip.background = element_rect(colour = "transparent",  fill = "transparent"),
+             legend.margin = margin(0, 0, 0, 0),
+             legend.box.margin = margin(0, 0, -8, 0),
+             plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "in"))
+```
+
+# GPS processing
+
+I used data from the autopilot instead of the datalogger because it has a higher temporal resolution. 
+
+```{r read-autopilot}
+autopilot <- read_delim("data/datalogger/SBEcho_autopilot.txt", show_col_types = F, locale = locale(tz = "UTC")) %>% 
+  # Filter data for Hywind Scotland
+  filter(between(Time, ymd_hms("2021-06-08 10:00:00", tz = "UTC"), ymd_hms("2021-08-15 14:00:00", tz = "UTC"))) 
+```
+Map with location of the SB during the survey.
+
+```{r map-survey, warning=FALSE}
+autopilot %>% 
+  ggplot() +
+  # Coastlines
+  geom_polygon(data = coast, aes(x = lon, y = lat, group = group), fill = "#09101D", lwd = 0.2) +
+  # SB track
+  # geom_point(aes(x = Long, y = Lat, col = Velocity), size = 1) +
+  geom_path(aes(x = Long, y = Lat, col = Velocity), size = 0.8) +
+  # Legend
+  annotate("text", x = 8.2, y = 60, label = expression(italic("Norway")), col = "#5B606D") +
+  annotate("text", x = -3.7, y = 57.2, label = expression(italic("Scotland")), col = "#5B606D") +
+  annotate("text", x = 9.2, y = 56.3, label = expression(italic("Denmark")), col = "#5B606D") +
+  scale_x_continuous("Longitude (°E)", breaks = seq(-180, 180, 2)) +
+  scale_y_continuous("Latitude (°N)", breaks = seq(-90, 90, 1)) +
+  scale_color_viridis_c(expression("Sailing speed (m s"^-1*")"), option = "plasma") + 
+  coord_quickmap(xlim = c(-5, 10), y = c(56, 61)) +
+  theme(panel.background = element_rect(fill = "#112330"),
+        legend.position = "top",
+        legend.title = element_text(vjust = 1),
+        legend.key.height = unit(0.1, "in"),
+        legend.key.width = unit(0.35, "in"))
+```
+
+Format data to be read by Echoview.
+
+```{r save-gps}
+# Save EV gps.csv
+EV_gps_csv(date = autopilot$Time, lat = autopilot$Lat, lon = autopilot$Long, new_file_path = "data/datalogger/HyScot_gps_positions")
+```
+
+# Echosounder calibration
+
+Calibration was done by Offshore sensing AS in Bergen prior to the survey. They used a 38.1 mm sphere but environmental conditions were not recorded. 
+Load calibration data of the 38.1 mm WC-Co sphere.
+
+```{r load-calib}
+# Read xml
+SB_calib <- read_xml("data/ek80/cal/SB_CAL_38.1MM_Hywind_Scotland.xml") %>% 
+  xmlParse()
+
+# Extract calibration results
+SB_calib_res <- xmlToDataFrame(nodes = getNodeSet(SB_calib, "//CalibrationResults")) %>% 
+  # Convert data to long format
+  separate_rows(everything(), sep = ";") %>% 
+  # Convert to numeric
+  mutate(across(everything(), as.numeric)) 
+```
+
+Plot calibration results.
+
+```{r plot-calib}
+SB_calib_res %>% 
+  # Convert frequency from Hz to kHz
+  mutate(Frequency = Frequency / 1000) %>% 
+  # Long format for plotting
+  pivot_longer(2:10, names_to = "variable", values_to = "values") %>% 
+  # Plotting
+  ggplot() +
+  geom_path(aes(x = Frequency, y = values, col = variable)) +
+  lemon::facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+Format data to be read by Echoview.
+
+```{r format-calib, message=FALSE}
+# Get values as vectors for updating ecs file
+SB_calib_vec <- xmlToDataFrame(nodes = getNodeSet(SB_calib, "//CalibrationResults")) 
+
+# Combine into single vectors
+SB_calib_ecs <- SB_calib_vec %>% 
+  unite(FrequencyTableWideband, starts_with("Frequency"), sep = ";") %>% 
+  unite(GainTableWideband, starts_with("Gain"), sep = ";") %>% 
+  unite(MajorAxisBeamWidthTableWideband, starts_with("BeamWidthAthwartship"), sep = ";") %>% 
+  unite(MajorAxisAngleOffsetTableWideband, starts_with("AngleOffsetAthwartship"), sep = ";") %>% 
+  unite(MinorAxisBeamWidthTableWideband, starts_with("BeamWidthAlongship"), sep = ";") %>% 
+  unite(MinorAxisAngleOffsetTableWideband, starts_with("AngleOffsetAlongship"), sep = ";") %>% 
+  # Select relevant variables
+  select(FrequencyTableWideband, GainTableWideband, MajorAxisBeamWidthTableWideband, MajorAxisAngleOffsetTableWideband, 
+         MinorAxisBeamWidthTableWideband, MinorAxisAngleOffsetTableWideband)
+```
+
+Update `ecs` file. The function `update_ecs` creates a new `ecs` file and does not replace the template.
+
+```{r update-ecs}
+# Update ecs file
+EV_update_ecs(cal_file = "data/ek80/cal/HyTamp_SB_FM200_cal_template.ecs", 
+              new_file = "data/ek80/cal/HyTamp_SB_FM200_cal_calibrated.ecs",
+              frequency_FM = SB_calib_ecs$FrequencyTableWideband, 
+              gain_FM = SB_calib_ecs$GainTableWideband,
+              major_beam_FM = SB_calib_ecs$MajorAxisBeamWidthTableWideband,
+              major_angle_FM = SB_calib_ecs$MajorAxisAngleOffsetTableWideband,
+              minor_beam_FM = SB_calib_ecs$MinorAxisBeamWidthTableWideband,
+              minor_angle_FM = SB_calib_ecs$MinorAxisAngleOffsetTableWideband)
+```
