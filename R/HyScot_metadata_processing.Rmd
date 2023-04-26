@@ -15,16 +15,16 @@ This document contains the code that extracts GPS fixes for the Sailbuoy which s
 # Packages required
 
 ```{r load-packages, message=FALSE}
-library(tidyverse)                    # Tidy code
-library(XML)                          # Parse xml to dataframe
-library(xml2)                         # Read xml
+library(tidyverse)          # Tidy code
 source("R/functions/EV_gps_csv.R")    # Format GPS data to be read by Echoview
+library(XML)                # Parse xml to dataframe
+library(xml2)               # Read xml
 source("R/functions/EV_update_ecs.R") # Update ecs file
 ```
 
 Load coastline shapefile.
 
-```{r coastline, warning=FALSE}
+```{r, warning=FALSE}
 # Coastlines
 coast <- rgdal::readOGR("data/bathy/ne_10m_land.shp", verbose = F) %>%
   # Convert to dataframe
@@ -87,7 +87,7 @@ autopilot %>%
 
 Format data to be read by Echoview.
 
-```{r save-gps}
+```{r}
 # Save EV gps.csv
 EV_gps_csv(date = autopilot$Time, lat = autopilot$Lat, lon = autopilot$Long, new_file_path = "data/datalogger/HyScot_gps_positions")
 ```
@@ -97,7 +97,7 @@ EV_gps_csv(date = autopilot$Time, lat = autopilot$Lat, lon = autopilot$Long, new
 Calibration was done by Offshore sensing AS in Bergen prior to the survey. They used a 38.1 mm sphere but environmental conditions were not recorded. 
 Load calibration data of the 38.1 mm WC-Co sphere.
 
-```{r load-calib}
+```{r SB-calib-results}
 # Read xml
 SB_calib <- read_xml("data/ek80/cal/SB_CAL_38.1MM_Hywind_Scotland.xml") %>% 
   xmlParse()
@@ -128,7 +128,7 @@ SB_calib_res %>%
 
 Format data to be read by Echoview.
 
-```{r format-calib, message=FALSE}
+```{r SB-gather-calib-for-ecs, message=FALSE}
 # Get values as vectors for updating ecs file
 SB_calib_vec <- xmlToDataFrame(nodes = getNodeSet(SB_calib, "//CalibrationResults")) 
 
@@ -145,12 +145,15 @@ SB_calib_ecs <- SB_calib_vec %>%
          MinorAxisBeamWidthTableWideband, MinorAxisAngleOffsetTableWideband)
 ```
 
-Update `ecs` file. The function `update_ecs` creates a new `ecs` file and does not replace the template.
+Update `ecs` file. The function `update_ecs` creates a new `ecs` file and does not replace the template. I use mean water temperature and salinity from the Hywind Scotland report. These data are averages for the month of June.
 
-```{r update-ecs}
+```{r SB-update-ecs}
 # Update ecs file
 EV_update_ecs(cal_file = "data/ek80/cal/HyTamp_SB_FM200_cal_template.ecs", 
               new_file = "data/ek80/cal/HyTamp_SB_FM200_cal_calibrated.ecs",
+              temp_new = 8.5,
+              sal_new = 35,
+              depth_new = 60,
               frequency_FM = SB_calib_ecs$FrequencyTableWideband, 
               gain_FM = SB_calib_ecs$GainTableWideband,
               major_beam_FM = SB_calib_ecs$MajorAxisBeamWidthTableWideband,
