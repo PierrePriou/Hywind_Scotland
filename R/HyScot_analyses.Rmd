@@ -1,0 +1,109 @@
+---
+title: "Hywind Scotland - Data analyses"
+author: "[Pierre Priou](ppr@akvaplan.niva.no)"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+---
+
+This document contains the code for analyzing EK80 data from the Hywind Scotlan survey.
+
+# Packages required
+
+```{r load-packages, message=FALSE}
+library(tidyverse)  # Tidy code
+library(sf)         # Spatial data
+library(lemon)      # Nice facets
+```
+
+Set figure theme.
+
+```{r update-fig-theme}
+# Theme for figures
+theme_set(theme_bw())
+theme_update(panel.grid = element_blank(), 
+             panel.border = element_blank(), 
+             axis.line = element_line(),
+             axis.text = element_text(size = 8),
+             axis.title = element_text(size = 9),
+             legend.title = element_text(size = 9),
+             strip.text.x = element_text(size = 8, face = "plain", hjust = 0.5),
+             strip.background = element_rect(colour = "transparent",  fill = "transparent"),
+             legend.margin = margin(0, 0, 0, 0),
+             legend.box.margin = margin(0, 0, -8, 0),
+             plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "in"))
+```
+# Data loading
+
+Virginie provided a `.Rdata` file that contained all the data.
+
+```{r load-data}
+load("data/analyses Gin/2023_Reanalysis.RData")
+```
+
+Tidy dataframes.
+
+```{r tidy-data}
+Sv_tidy <- Integration_10mDB_sfp %>% 
+  # Rename variables
+  rename(depth = Layer_depth_min) %>% 
+  # Unite date and time
+  unite(date_S, Date_S, Time_S, sep = " ", remove = F) %>%
+  # Fix variable type and tidy
+  mutate(date = date(SampleTime),
+         date_S = ymd_hms(date_S, tz = "UTC"),
+         period = cut(date, breaks = seq(min(date) - 1, max(date), 6), right = T, include.lowest = T),
+         time_floor = hms::as_hms(floor_date(date_S, "20 mins")), 
+         hour = hour(date_S),
+         sv_lin = 10 ^ (Sv_mean / 10),
+         DistCat = factor(DistCat),
+         area = factor(if_else(DistCat == "Outside", "outside", "inside"))) %>%
+  # Tidy data set
+  filter(Sv_mean < 0 & is.na(NASC) == F & Height_mean >= 9) %>% 
+  # Select only relevant variables
+  select(date_S, time_floor, hour, period, area, depth, sv_lin, NASC) %>% 
+  st_drop_geometry()
+```
+
+# Analyses
+ 
+## Synthetic echograms
+
+Calculate mean Sv and NASC per 10 m cell per hour inside and outside the park per period (~ 1 week).
+
+```{r 24h-summary}
+MVBS_24h <- Sv_tidy %>% 
+  group_by(area, period, hour, depth) %>% 
+  summarise(sv_lin = mean(sv_lin, na.rm = T),
+            NASC_mean = mean(NASC, na.rm = T),
+            n = n()) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin))
+```
+
+Create a synthetic echogram for inside / outisde the park per week.
+
+```{r synthetic-echograms}
+MVBS_24h %>% 
+  ggplot() +
+  geom_raster(aes(x = hour, y = depth, fill = Sv_mean)) + 
+  scale_fill_viridis_c(option = "turbo") + 
+  scale_y_reverse() + 
+  facet_rep_grid(period ~ area, repeat.tick.labels = T)
+```
+
+Count of samples used to calculate mean Sv.
+
+```{r count-echograms}
+MVBS_24h %>% 
+  ggplot() +
+  geom_raster(aes(x = hour, y = depth, fill = n)) + 
+  scale_fill_viridis_c(option = "viridis") +
+  scale_y_reverse() + 
+  facet_rep_grid(period ~ area, repeat.tick.labels = T)
+```
+
