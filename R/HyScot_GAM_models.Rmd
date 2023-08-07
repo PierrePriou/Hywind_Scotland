@@ -1,0 +1,2697 @@
+---
+title: "Hywind Scotland - Data exploration and Generalized Additive Models"
+author: "Pierre Priou - ppr@akvaplan.niva.no"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+---
+
+This document contains the code for the data exploration and for the generalized additive modeling of the Hywind Scotland paper.
+
+# Packages required
+
+```{r load-packages, message=FALSE}
+library(tidyverse)  # Tidy code
+library(rbbt)       # Zotero connector
+library(lemon)      # Nice facets
+library(mgcv)       # GAMs
+library(gratia)     # Visualize GAMs
+library(sf)         # Spatial data
+library(suncalc)    # Sun position and timings
+library(cowplot)    # Multiple plots
+library(marmap)     # Download bathymetry
+library(cmocean)    # Oceanographic colorscales
+library(ggsn)       # Scale bar
+library(ggnewscale) # Multiple color scales
+```
+
+Set figure theme.
+
+```{r update-fig-theme}
+# Theme for figures
+theme_set(theme_bw())
+theme_update(panel.grid = element_blank(), 
+             panel.border = element_blank(),
+             axis.line = element_line(),
+             axis.text = element_text(size = 9),
+             axis.title = element_text(size = 10),
+             legend.title = element_text(size = 10),
+             strip.text.x = element_text(size = 9, face = "plain", hjust = 0.5),
+             strip.background = element_rect(colour = "transparent",  fill = "transparent"),
+             legend.margin = margin(0, 0, 0, 0),
+             legend.box.margin = margin(0, 0, -8, 0),
+             plot.margin = unit(c(0.05, 0.05, 0.05, 0.05), "in"))
+```
+
+# Load data
+
+Load echosounder data. 
+
+```{r load-data}
+load("data/analyses Gin/2023_Reanalysis.RData")
+
+# Remove unused variables
+rm(list = ls(pattern = "Region"), Integration_10mDB, Integration_10mDB_sfp, Integration_complete)
+```
+
+Windpark location.
+
+```{r coord-park}
+# Coordinates of the five turbines
+coord_turbines <- tibble(turbine = c("T-1", "T-2", "T-3", "T-4", "T-5"),
+                         lat = c(57.49723, 57.49078, 57.48429, 57.48479, 57.47830),
+                         lon = c(-1.37175, -1.35198, -1.33229, -1.37236, -1.35262))
+
+# Coordinates of center of the park
+coord_centre_park<- coord_turbines %>% 
+  summarise(lat = mean(lat),
+            lon = mean(lon)) %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = st_crs(4326))
+  
+# Linetstring of the park
+coord_park_linestring <- coord_turbines %>% 
+  select(lon, lat) %>% 
+  as.matrix() %>% 
+  st_linestring(.) %>% 
+  st_sfc(crs = st_crs(4326))
+
+# Polygon park
+coord_park <- tibble(park = "park_limits",
+                     lat = c(57.50490, 57.48155, 57.47104, 57.48571),
+                     lon = c(-1.38050, -1.38519, -1.35300, -1.31781))
+```
+
+Load spatial data. 
+
+```{r}
+# load("data/shapefiles/spatialFeatures.RData")
+```
+
+
+Bathymetry
+
+```{r bathymetry, message=FALSE}
+# Download bathy data
+bathy <- getNOAA.bathy(lon1 = -2, lon2 = 0, lat1 = 57, lat2 = 58, resolution = 0.25, keep = T, path = "data/bathy/") %>%
+  fortify.bathy() %>%
+  rename(lon = x, lat = y, depth = z)
+```
+
+# Data tidying
+
+Tidy raw data.
+
+```{r SB-raw, message=FALSE}
+SB_raw <- Integration_10mDB_sfp_rot %>% 
+  # Rename variables
+  rename(depth_min = Layer_depth_min,
+         depth_max = Layer_depth_max,
+         depth_mean = Depth_mean,
+         ID = Process_ID,
+         dist_cat = DistCat,
+         height_mean = Height_mean,
+         xc = newCoords_recX,
+         yc = newCoords_recY) %>% 
+  # Calculate lat-lon and mean de
+  rowwise() %>% 
+  mutate(lat = mean(Lat_S, Lat_E),
+         lon = mean(Lon_S, Lon_E)) %>% 
+  # Unite date and time
+  unite(date, Date_S, Time_S, sep = " ", remove = F) %>%
+  # Fix variable type and tidy
+  mutate(date = ymd_hms(date, tz = "UTC"),
+         day = date(SampleTime),
+         yday = yday(date),
+         period = cut(day, breaks = seq(min(day) - 1, max(day), 6), right = T, include.lowest = T),
+         hour = hour(date),
+         sv_lin = 10 ^ (Sv_mean / 10),
+         dist_cat = factor(dist_cat),
+         area = factor(if_else(dist_cat == "outside", "outside", "inside"))) %>%
+  st_drop_geometry() %>% 
+  # Calculate sun timing and position
+  mutate(suncalc = getSunlightTimes(data = data.frame(date = day, lat = lat, lon = lon), 
+                                    keep = c("sunrise", "sunset"),
+                                    tz = "UTC"),
+         sunangle = getSunlightPosition(data = data.frame(date = date, lat = lat, lon = lon), 
+                                        keep = c("altitude")), 
+         sunrise = hms::as_hms(suncalc$sunrise), # UTC
+         sunset = hms::as_hms(suncalc$sunset), # UTC
+         time_loc = hms::as_hms(date),
+         # Sun angle in degrees above the horizon
+         sun_angle_deg = sunangle$altitude * 180 / pi) %>% 
+  mutate(day_night = factor(if_else(between(time_loc, sunrise, sunset), "day", "night"), levels = c("day", "night"))) %>% 
+  # Get bottom depth
+  group_by(ID) %>% 
+  mutate(bottom_depth = max(Exclude_below_line_depth_mean)) %>% 
+  ungroup() %>% 
+  # Convert to spatial dataframe
+  st_as_sf(coords = c("lon", "lat"), remove = F, crs = st_crs(4326)) %>% 
+  # Add coordinates of the centre of the windpark
+  rename(SB_geometry = geometry) %>% 
+  bind_cols(., coord_centre_park) %>% 
+  rename(centre_park_geom = last_col()) %>% 
+  # Add coordinate of the windpark (linestring)
+  bind_cols(., coord_park_linestring) %>% 
+  rename(linestring_park_geom = last_col()) %>% 
+  # Calculate distances to park
+  mutate(dist_park_km = as.numeric(st_distance(SB_geometry, centre_park_geom, by_element = T)) / 1000,
+         min_dist_park_km = as.numeric(st_distance(SB_geometry, linestring_park_geom, by_element = T)) / 1000) %>% 
+  # Convert back to tibble
+  st_drop_geometry() %>% 
+  # Select only relevant variables
+  select(ID, date, day, yday, hour, day_night, sun_angle_deg, bottom_depth, min_dist_park_km, dist_park_km, lat, lon, xc, yc, 
+         area, depth_min, depth_max, depth_mean, height_mean, sv_lin, Sv_mean, NASC)
+```
+
+## Integrated dataset
+
+Tidy data and integrated over the entire water column. For integrated data I remove data that had less than a 40 m integration depth.
+
+```{r SB-tidy, message=FALSE}
+# Tidy dataset
+SB_tidy <- SB_raw %>% 
+  # Remove empty water and outliers
+  filter(Sv_mean < 0 & is.na(NASC) == F & is.na(sv_lin) == F & is.na(NASC) == F & height_mean >= 9) %>% 
+  # Remove data too far from the farm (15 km)
+  filter(dist_park_km <= 15) %>% 
+  # Remove outliers (strong backscatter near bottom most likely not of biological origin)
+  filter(!ID %in% c(3353, 2468)) %>% 
+  group_by(ID, date, day, yday, hour, day_night, sun_angle_deg, bottom_depth, min_dist_park_km, dist_park_km, lat, lon, xc, yc, area) %>% 
+  mutate(integration_depth = sum(height_mean)) %>% 
+  ungroup() %>% 
+  # Calculate SA
+  mutate(SA = 10 * log10(NASC))
+
+# Integrate over entire water column
+SB_int <- SB_tidy %>%
+  group_by(ID, date, day, yday, hour, day_night, sun_angle_deg, bottom_depth, min_dist_park_km, dist_park_km, lat, lon, xc, yc, area) %>% 
+  summarise(sv_lin_mean = mean(sv_lin),
+            NASC_int = sum(NASC), 
+            integration_depth = sum(height_mean), 
+            CM = sum(depth_mean * sv_lin) / sum(sv_lin),
+            inertia = sum(((depth_mean - CM) ^ 2) * sv_lin) / sum(sv_lin)) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin_mean),
+         SA = 10 * log10(NASC_int)) %>% 
+  # Remove data that were not integrated over at least 40 m
+  filter(integration_depth > 40)
+```
+
+## Transect dataset
+
+Select transects.
+
+```{r SB-transects}
+# All dataset
+SB_tidy_transect <- SB_tidy %>%
+  # Create variable for transect
+  mutate(transect = factor(
+    case_when(between(date, ymd_hms("2021-06-25 21:00:00", tz = "UTC"), ymd_hms("2021-06-26 01:00:00", tz = "UTC")) ~ "T01",
+              between(date, ymd_hms("2021-06-26 06:10:00", tz = "UTC"), ymd_hms("2021-06-26 09:00:00", tz = "UTC")) ~ "T02-1",
+              between(date, ymd_hms("2021-06-26 09:30:00", tz = "UTC"), ymd_hms("2021-06-26 10:40:00", tz = "UTC")) ~ "T02-2",
+              between(date, ymd_hms("2021-06-30 06:00:00", tz = "UTC"), ymd_hms("2021-06-30 09:45:00", tz = "UTC")) ~ "T03-1",
+              between(date, ymd_hms("2021-06-30 09:45:00", tz = "UTC"), ymd_hms("2021-06-30 12:30:00", tz = "UTC")) ~ "T03-2",
+              between(date, ymd_hms("2021-06-30 14:00:00", tz = "UTC"), ymd_hms("2021-06-30 15:15:00", tz = "UTC")) ~ "T04-1",
+              between(date, ymd_hms("2021-06-30 15:15:00", tz = "UTC"), ymd_hms("2021-06-30 16:30:00", tz = "UTC")) ~ "T04-2",
+              between(date, ymd_hms("2021-07-01 14:00:00", tz = "UTC"), ymd_hms("2021-07-01 17:30:00", tz = "UTC")) ~ "T05-1",
+              between(date, ymd_hms("2021-07-01 17:30:00", tz = "UTC"), ymd_hms("2021-07-01 19:30:00", tz = "UTC")) ~ "T05-2",
+              between(date, ymd_hms("2021-07-01 21:00:00", tz = "UTC"), ymd_hms("2021-07-02 01:30:00", tz = "UTC")) ~ "T06",
+              between(date, ymd_hms("2021-07-05 11:15:00", tz = "UTC"), ymd_hms("2021-07-05 13:15:00", tz = "UTC")) ~ "T07-1",
+              between(date, ymd_hms("2021-07-05 13:15:00", tz = "UTC"), ymd_hms("2021-07-05 17:45:00", tz = "UTC")) ~ "T07-2",
+              between(date, ymd_hms("2021-07-05 18:30:00", tz = "UTC"), ymd_hms("2021-07-05 22:00:00", tz = "UTC")) ~ "T08-1",
+              between(date, ymd_hms("2021-07-05 22:00:00", tz = "UTC"), ymd_hms("2021-07-05 23:30:00", tz = "UTC")) ~ "T08-2",
+              between(date, ymd_hms("2021-07-06 06:00:00", tz = "UTC"), ymd_hms("2021-07-06 12:15:00", tz = "UTC")) ~ "T09-1",
+              between(date, ymd_hms("2021-07-06 12:15:00", tz = "UTC"), ymd_hms("2021-07-06 13:15:00", tz = "UTC")) ~ "T09-2",
+              between(date, ymd_hms("2021-07-06 13:15:00", tz = "UTC"), ymd_hms("2021-07-06 16:00:00", tz = "UTC")) ~ "T10-1",
+              between(date, ymd_hms("2021-07-06 16:00:00", tz = "UTC"), ymd_hms("2021-07-06 19:45:00", tz = "UTC")) ~ "T10-2",
+              between(date, ymd_hms("2021-07-07 06:30:00", tz = "UTC"), ymd_hms("2021-07-07 11:15:00", tz = "UTC")) ~ "T11-1",
+              between(date, ymd_hms("2021-07-07 11:15:00", tz = "UTC"), ymd_hms("2021-07-07 13:00:00", tz = "UTC")) ~ "T11-2",
+              between(date, ymd_hms("2021-07-12 10:30:00", tz = "UTC"), ymd_hms("2021-07-12 13:30:00", tz = "UTC")) ~ "T12-1",
+              between(date, ymd_hms("2021-07-12 13:30:00", tz = "UTC"), ymd_hms("2021-07-12 16:45:00", tz = "UTC")) ~ "T12-2",
+              between(date, ymd_hms("2021-07-12 17:30:00", tz = "UTC"), ymd_hms("2021-07-12 19:30:00", tz = "UTC")) ~ "T13-1",
+              between(date, ymd_hms("2021-07-12 19:30:00", tz = "UTC"), ymd_hms("2021-07-12 21:45:00", tz = "UTC")) ~ "T13-2",
+              between(date, ymd_hms("2021-07-15 12:30:00", tz = "UTC"), ymd_hms("2021-07-15 17:15:00", tz = "UTC")) ~ "T14-1",
+              between(date, ymd_hms("2021-07-15 17:15:00", tz = "UTC"), ymd_hms("2021-07-15 21:45:00", tz = "UTC")) ~ "T14-2",
+              between(date, ymd_hms("2021-07-20 06:00:00", tz = "UTC"), ymd_hms("2021-07-20 14:45:00", tz = "UTC")) ~ "T16-1",
+              between(date, ymd_hms("2021-07-20 14:45:00", tz = "UTC"), ymd_hms("2021-07-20 18:45:00", tz = "UTC")) ~ "T16-2",
+              between(date, ymd_hms("2021-07-20 18:45:00", tz = "UTC"), ymd_hms("2021-07-20 21:30:00", tz = "UTC")) ~ "T17",
+              between(date, ymd_hms("2021-07-20 21:30:00", tz = "UTC"), ymd_hms("2021-07-20 23:15:00", tz = "UTC")) ~ "T17",
+              between(date, ymd_hms("2021-07-21 13:45:00", tz = "UTC"), ymd_hms("2021-07-21 17:15:00", tz = "UTC")) ~ "T18-1",
+              between(date, ymd_hms("2021-07-21 17:15:00", tz = "UTC"), ymd_hms("2021-07-21 19:00:00", tz = "UTC")) ~ "T18-2",
+              between(date, ymd_hms("2021-07-21 19:45:00", tz = "UTC"), ymd_hms("2021-07-22 01:45:00", tz = "UTC")) ~ "T19",
+              between(date, ymd_hms("2021-07-22 02:30:00", tz = "UTC"), ymd_hms("2021-07-22 07:00:00", tz = "UTC")) ~ "T20-1",
+              between(date, ymd_hms("2021-07-22 07:00:00", tz = "UTC"), ymd_hms("2021-07-22 10:00:00", tz = "UTC")) ~ "T20-2",
+              between(date, ymd_hms("2021-07-23 12:30:00", tz = "UTC"), ymd_hms("2021-07-23 17:15:00", tz = "UTC")) ~ "T21-1",
+              between(date, ymd_hms("2021-07-23 17:15:00", tz = "UTC"), ymd_hms("2021-07-23 20:00:00", tz = "UTC")) ~ "T21-2",
+              between(date, ymd_hms("2021-07-23 21:30:00", tz = "UTC"), ymd_hms("2021-07-24 02:00:00", tz = "UTC")) ~ "T22",
+              between(date, ymd_hms("2021-07-24 03:00:00", tz = "UTC"), ymd_hms("2021-07-24 09:00:00", tz = "UTC")) ~ "T23",
+              TRUE ~ "other")),
+    transect_time = factor(case_when(transect %in% c("T01", "T06", "T17", "T19", "T21") ~ "night",
+                                     TRUE ~ "day"))) %>% 
+  # Remove data not on transects
+  filter(transect != "other")
+
+# Integrated dataset
+SB_int_transect <- SB_int %>%
+  # Create variable for transect
+  mutate(transect = factor(
+    case_when(between(date, ymd_hms("2021-06-25 21:00:00", tz = "UTC"), ymd_hms("2021-06-26 01:00:00", tz = "UTC")) ~ "T01",
+              between(date, ymd_hms("2021-06-26 06:10:00", tz = "UTC"), ymd_hms("2021-06-26 09:00:00", tz = "UTC")) ~ "T02-1",
+              between(date, ymd_hms("2021-06-26 09:30:00", tz = "UTC"), ymd_hms("2021-06-26 10:40:00", tz = "UTC")) ~ "T02-2",
+              between(date, ymd_hms("2021-06-30 06:00:00", tz = "UTC"), ymd_hms("2021-06-30 09:45:00", tz = "UTC")) ~ "T03-1",
+              between(date, ymd_hms("2021-06-30 09:45:00", tz = "UTC"), ymd_hms("2021-06-30 12:30:00", tz = "UTC")) ~ "T03-2",
+              between(date, ymd_hms("2021-06-30 14:00:00", tz = "UTC"), ymd_hms("2021-06-30 15:15:00", tz = "UTC")) ~ "T04-1",
+              between(date, ymd_hms("2021-06-30 15:15:00", tz = "UTC"), ymd_hms("2021-06-30 16:30:00", tz = "UTC")) ~ "T04-2",
+              between(date, ymd_hms("2021-07-01 14:00:00", tz = "UTC"), ymd_hms("2021-07-01 17:30:00", tz = "UTC")) ~ "T05-1",
+              between(date, ymd_hms("2021-07-01 17:30:00", tz = "UTC"), ymd_hms("2021-07-01 19:30:00", tz = "UTC")) ~ "T05-2",
+              between(date, ymd_hms("2021-07-01 21:00:00", tz = "UTC"), ymd_hms("2021-07-02 01:30:00", tz = "UTC")) ~ "T06",
+              between(date, ymd_hms("2021-07-05 11:15:00", tz = "UTC"), ymd_hms("2021-07-05 13:15:00", tz = "UTC")) ~ "T07-1",
+              between(date, ymd_hms("2021-07-05 13:15:00", tz = "UTC"), ymd_hms("2021-07-05 17:45:00", tz = "UTC")) ~ "T07-2",
+              between(date, ymd_hms("2021-07-05 18:30:00", tz = "UTC"), ymd_hms("2021-07-05 22:00:00", tz = "UTC")) ~ "T08-1",
+              between(date, ymd_hms("2021-07-05 22:00:00", tz = "UTC"), ymd_hms("2021-07-05 23:30:00", tz = "UTC")) ~ "T08-2",
+              between(date, ymd_hms("2021-07-06 06:00:00", tz = "UTC"), ymd_hms("2021-07-06 12:15:00", tz = "UTC")) ~ "T09-1",
+              between(date, ymd_hms("2021-07-06 12:15:00", tz = "UTC"), ymd_hms("2021-07-06 13:15:00", tz = "UTC")) ~ "T09-2",
+              between(date, ymd_hms("2021-07-06 13:15:00", tz = "UTC"), ymd_hms("2021-07-06 16:00:00", tz = "UTC")) ~ "T10-1",
+              between(date, ymd_hms("2021-07-06 16:00:00", tz = "UTC"), ymd_hms("2021-07-06 19:45:00", tz = "UTC")) ~ "T10-2",
+              between(date, ymd_hms("2021-07-07 06:30:00", tz = "UTC"), ymd_hms("2021-07-07 11:15:00", tz = "UTC")) ~ "T11-1",
+              between(date, ymd_hms("2021-07-07 11:15:00", tz = "UTC"), ymd_hms("2021-07-07 13:00:00", tz = "UTC")) ~ "T11-2",
+              between(date, ymd_hms("2021-07-12 10:30:00", tz = "UTC"), ymd_hms("2021-07-12 13:30:00", tz = "UTC")) ~ "T12-1",
+              between(date, ymd_hms("2021-07-12 13:30:00", tz = "UTC"), ymd_hms("2021-07-12 16:45:00", tz = "UTC")) ~ "T12-2",
+              between(date, ymd_hms("2021-07-12 17:30:00", tz = "UTC"), ymd_hms("2021-07-12 19:30:00", tz = "UTC")) ~ "T13-1",
+              between(date, ymd_hms("2021-07-12 19:30:00", tz = "UTC"), ymd_hms("2021-07-12 21:45:00", tz = "UTC")) ~ "T13-2",
+              between(date, ymd_hms("2021-07-15 12:30:00", tz = "UTC"), ymd_hms("2021-07-15 17:15:00", tz = "UTC")) ~ "T14-1",
+              between(date, ymd_hms("2021-07-15 17:15:00", tz = "UTC"), ymd_hms("2021-07-15 21:45:00", tz = "UTC")) ~ "T14-2",
+              between(date, ymd_hms("2021-07-20 06:00:00", tz = "UTC"), ymd_hms("2021-07-20 14:45:00", tz = "UTC")) ~ "T16-1",
+              between(date, ymd_hms("2021-07-20 14:45:00", tz = "UTC"), ymd_hms("2021-07-20 18:45:00", tz = "UTC")) ~ "T16-2",
+              between(date, ymd_hms("2021-07-20 18:45:00", tz = "UTC"), ymd_hms("2021-07-20 21:30:00", tz = "UTC")) ~ "T17",
+              between(date, ymd_hms("2021-07-20 21:30:00", tz = "UTC"), ymd_hms("2021-07-20 23:15:00", tz = "UTC")) ~ "T17",
+              between(date, ymd_hms("2021-07-21 13:45:00", tz = "UTC"), ymd_hms("2021-07-21 17:15:00", tz = "UTC")) ~ "T18-1",
+              between(date, ymd_hms("2021-07-21 17:15:00", tz = "UTC"), ymd_hms("2021-07-21 19:00:00", tz = "UTC")) ~ "T18-2",
+              between(date, ymd_hms("2021-07-21 19:45:00", tz = "UTC"), ymd_hms("2021-07-22 01:45:00", tz = "UTC")) ~ "T19",
+              between(date, ymd_hms("2021-07-22 02:30:00", tz = "UTC"), ymd_hms("2021-07-22 07:00:00", tz = "UTC")) ~ "T20-1",
+              between(date, ymd_hms("2021-07-22 07:00:00", tz = "UTC"), ymd_hms("2021-07-22 10:00:00", tz = "UTC")) ~ "T20-2",
+              between(date, ymd_hms("2021-07-23 12:30:00", tz = "UTC"), ymd_hms("2021-07-23 17:15:00", tz = "UTC")) ~ "T21-1",
+              between(date, ymd_hms("2021-07-23 17:15:00", tz = "UTC"), ymd_hms("2021-07-23 20:00:00", tz = "UTC")) ~ "T21-2",
+              between(date, ymd_hms("2021-07-23 21:30:00", tz = "UTC"), ymd_hms("2021-07-24 02:00:00", tz = "UTC")) ~ "T22",
+              between(date, ymd_hms("2021-07-24 03:00:00", tz = "UTC"), ymd_hms("2021-07-24 09:00:00", tz = "UTC")) ~ "T23",
+              TRUE ~ "other")),
+    transect_time = factor(case_when(transect %in% c("T01", "T06", "T17", "T19", "T21") ~ "night",
+                                     TRUE ~ "day"))) %>% 
+  # Remove data not on transects
+  filter(transect != "other")
+```
+
+Interactive map of the survey to select the transects.
+
+```{r interactive-map-transect, warning=FALSE}
+plotly::ggplotly(bathy %>%
+    filter(depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)) %>%
+      ggplot() +
+      geom_contour(aes(x = lon, y = lat, z = depth), breaks = c(-80,-90,-100,-110), linewidth = 0.2, col = "black", alpha = 1) +
+      geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "darkorange", linewidth = 1) + geom_point(data = coord_turbines, aes(x = lon, y = lat), col = "gold", pch = 17, size = 2) +
+      # geom_path(data = SB_raw %>% filter(yday == 182), aes(x = lon, y = lat, label = paste0(date)), col = "red", lwd = 0.8) +
+      geom_path(data = SB_int_transect %>% filter(transect %in% 
+                                                    # c("T23"))
+                                                    c("T10-1", "T10-2"))
+                , aes(x = lon, y = lat, label = paste0(date, " - ", round(dist_park_km, 1)), col = transect), lwd = 0.8, alpha = 0.7) +
+      scale_x_continuous(breaks = seq(-180, 180, 0.1)) + scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+      theme(axis.line = element_blank(), panel.border = element_rect(linewidth = 1, fill = NA)))
+```
+
+## Spatially averaged dataset
+
+### All dataset
+
+Average data in cells for the entire dataset.
+
+```{r spatial-averaging-all-dataset, message=FALSE}
+# Define cell resolution in meters
+cell_res_m <- 500
+
+# All dataset
+SB_tidy_mean <- SB_tidy %>% 
+  # Round data in 500 m2 cells
+  mutate(xc_round = plyr::round_any(xc, cell_res_m) + 239161.4, # add 239161.4 to "decentre" it from the windpark
+         yc_round = plyr::round_any(yc, cell_res_m) + 6380079) %>% # add 6380079 to "decentre" it from the windpark
+  # Summarise data per cell
+  group_by(day, yday, day_night, xc_round, yc_round, depth_min, depth_max, depth_mean) %>% 
+  summarise(sv_lin_mean = mean(sv_lin),
+            NASC_mean = mean(NASC)) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin_mean),
+         SA = 10 * log10(NASC_mean)) %>% 
+  # Convert to spatial dataframe (note: EPSG:32631 - UTM 31N)
+  st_as_sf(coords = c("xc_round", "yc_round"), remove = F, crs = st_crs(32631)) %>% 
+  st_transform(crs = st_crs(4326)) %>% 
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2]) %>%
+  # Add centre of the park coordinate
+  rename(SB_geometry = geometry) %>% 
+  bind_cols(., coord_centre_park) %>% 
+  rename(centre_park_geom = last_col()) %>% 
+  # Add coordinate of the windpark (linestring)
+  bind_cols(., coord_park_linestring) %>% 
+  rename(linestring_park_geom = last_col()) %>% 
+  # Calculate distances to park
+  mutate(dist_park_km = as.numeric(st_distance(SB_geometry, centre_park_geom, by_element = T) / 1000),
+         min_dist_park_km = as.numeric(st_distance(SB_geometry, linestring_park_geom, by_element = T) / 1000)) %>% 
+  # Convert back to tibble
+  st_drop_geometry() %>% 
+  # Select only relevant variables
+  select(-centre_park_geom, -linestring_park_geom, -xc_round, -yc_round)
+
+# Integrated dataset
+SB_int_mean <- SB_int %>%
+  # Round data in 500 m2 cells
+  mutate(xc_round = plyr::round_any(xc, cell_res_m) + 239161.4, # add 239161.4 to "decentre" it from the windpark
+         yc_round = plyr::round_any(yc, cell_res_m) + 6380079) %>% # add 6380079 to "decentre" it from the windpark
+  # Summarise data per cell
+  group_by(day, yday, day_night, xc_round, yc_round) %>% 
+  summarise(sv_lin_mean = mean(sv_lin_mean),
+            NASC_int_mean = mean(NASC_int),
+            CM_mean = mean(CM),
+            inertia_mean = mean(inertia),
+            bottom_depth_mean = mean(bottom_depth)) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin_mean),
+         SA_mean = 10 * log10(NASC_int_mean)) %>% 
+  # Convert to spatial dataframe (note: EPSG:32631 - UTM 31N)
+  st_as_sf(coords = c("xc_round", "yc_round"), remove = F, crs = st_crs(32631)) %>% 
+  st_transform(crs = st_crs(4326)) %>% 
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2]) %>%
+  # Add centre of the park coordinate
+  rename(SB_geometry = geometry) %>% 
+  bind_cols(., coord_centre_park) %>% 
+  rename(centre_park_geom = last_col()) %>% 
+  # Add coordinate of the windpark (linestring)
+  bind_cols(., coord_park_linestring) %>% 
+  rename(linestring_park_geom = last_col()) %>% 
+  # Calculate distances to park
+  mutate(dist_park_km = as.numeric(st_distance(SB_geometry, centre_park_geom, by_element = T) / 1000),
+         min_dist_park_km = as.numeric(st_distance(SB_geometry, linestring_park_geom, by_element = T) / 1000)) %>% 
+  # Convert back to tibble
+  st_drop_geometry() %>% 
+  # Select only relevant variables
+  select(-centre_park_geom, -linestring_park_geom, -xc_round, -yc_round)
+```
+
+### Transect dataset
+
+Average data in cells for the entire dataset.
+
+```{r spatial-averaging-transect-dataset, message=FALSE}
+# Define cell resolution in meters
+cell_res_m <- 500
+
+# All dataset
+SB_tidy_transect_mean <- SB_tidy_transect %>% 
+  # Round data in 500 m2 cells
+  mutate(xc_round = plyr::round_any(xc, cell_res_m) + 239161.4, # add 239161.4 to "decentre" it from the windpark
+         yc_round = plyr::round_any(yc, cell_res_m) + 6380079) %>% # add 6380079 to "decentre" it from the windpark
+  # Summarise data per cell
+  group_by(day, yday, day_night, xc_round, yc_round, depth_min, depth_max, depth_mean, transect) %>% 
+  summarise(sv_lin_mean = mean(sv_lin),
+            NASC_mean = mean(NASC), 
+            bottom_depth_mean = mean(bottom_depth)) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin_mean),
+         SA = 10 * log10(NASC_mean)) %>% 
+  # Convert to spatial dataframe (note: EPSG:32631 - UTM 31N)
+  st_as_sf(coords = c("xc_round", "yc_round"), remove = F, crs = st_crs(32631)) %>% 
+  st_transform(crs = st_crs(4326)) %>% 
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2]) %>%
+  # Add centre of the park coordinate
+  rename(SB_geometry = geometry) %>% 
+  bind_cols(., coord_centre_park) %>% 
+  rename(centre_park_geom = last_col()) %>% 
+  # Add coordinate of the windpark (linestring)
+  bind_cols(., coord_park_linestring) %>% 
+  rename(linestring_park_geom = last_col()) %>% 
+  # Calculate distances to park
+  mutate(dist_park_km = as.numeric(st_distance(SB_geometry, centre_park_geom, by_element = T) / 1000),
+         min_dist_park_km = as.numeric(st_distance(SB_geometry, linestring_park_geom, by_element = T) / 1000)) %>% 
+  # Convert back to tibble
+  st_drop_geometry() %>% 
+  # Select only relevant variables
+  select(-centre_park_geom, -linestring_park_geom, -xc_round, -yc_round)
+
+# Integrated dataset
+SB_int_transect_mean <- SB_int_transect %>%
+  # Round data in 500 m2 cells
+  mutate(xc_round = plyr::round_any(xc, cell_res_m) + 239161.4, # add 239161.4 to "decentre" it from the windpark
+         yc_round = plyr::round_any(yc, cell_res_m) + 6380079) %>% # add 6380079 to "decentre" it from the windpark
+  # Summarise data per cell
+  group_by(day, yday, day_night, xc_round, yc_round, transect) %>% 
+  summarise(sv_lin_mean = mean(sv_lin_mean),
+            NASC_int_mean = mean(NASC_int),
+            CM_mean = mean(CM),
+            inertia_mean = mean(inertia),
+            bottom_depth_mean = mean(bottom_depth)) %>% 
+  ungroup() %>% 
+  mutate(Sv_mean = 10 * log10(sv_lin_mean),
+         SA_mean = 10 * log10(NASC_int_mean)) %>% 
+  # Convert to spatial dataframe (note: EPSG:32631 - UTM 31N)
+  st_as_sf(coords = c("xc_round", "yc_round"), remove = F, crs = st_crs(32631)) %>% 
+  st_transform(crs = st_crs(4326)) %>% 
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2]) %>%
+  # Add centre of the park coordinate
+  rename(SB_geometry = geometry) %>% 
+  bind_cols(., coord_centre_park) %>% 
+  rename(centre_park_geom = last_col()) %>% 
+  # Add coordinate of the windpark (linestring)
+  bind_cols(., coord_park_linestring) %>% 
+  rename(linestring_park_geom = last_col()) %>% 
+  # Calculate distances to park
+  mutate(dist_park_km = as.numeric(st_distance(SB_geometry, centre_park_geom, by_element = T) / 1000),
+         min_dist_park_km = as.numeric(st_distance(SB_geometry, linestring_park_geom, by_element = T) / 1000)) %>% 
+  # Convert back to tibble
+  st_drop_geometry() %>% 
+  # Select only relevant variables
+  select(-centre_park_geom, -linestring_park_geom, -xc_round, -yc_round)
+```
+
+# Data expoloration
+
+Prior to fitting the GAMs I look at the data.
+
+## Map
+
+Map of the survey.
+
+```{r map-survey, fig.width=8, fig.height=5}
+# Color scale
+map_hywind <- bathy %>%
+  filter(depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)) %>%
+  ggplot() +
+  # Bathy
+  geom_raster(aes(x = lon, y = lat, fill = depth), alpha = 0.85) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.85, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # Isobaths
+  geom_contour(aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy
+  geom_path(data = SB_tidy, aes(x = lon, y = lat), lwd = 0.5, col = "grey") +
+  geom_path(data = SB_int_transect %>% filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")), 
+            aes(x = lon, y = lat, col = transect), lwd = 0.8) +
+  scale_color_viridis_d("Transect ID", option = "plasma") +
+  # Color legend over two columns
+  guides(color = guide_legend(ncol = 3)) +
+  # Turbines and platforms
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 0.5, lty = 1) +
+  geom_point(data = coord_turbines, aes(x = lon, y = lat), col = "black", pch = 17, size = 1) +
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  scalebar(dist = 2, transform = TRUE, x.min = -1.35, x.max = -1.02, y.min = 57.362, y.max = 57.65,
+           st.size = 3.2, st.dist = 0.02, height = 0.02, border.size = 0.3, dist_unit = "km") +
+  # coord_quickmap(expand = F) +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+ggsave("plots/HyScot_map_SB.png", map_hywind, bg = "transparent", width = 8, height = 5, units = "in", dpi = 600)
+map_hywind
+```
+
+## Distributions {.tabset}
+
+NASC (m^2^ nmi^-2^) is following a gamma distribution, S~A~ (dB re 1 m^2^ nmi^-2^) and S~V~ (dB re 1 m^2^ m^-1^) a gaussian distribution with a slight left skew, inertia (m^-2^) a log normal distribution, and centre of mass (CM in m) is not following a specific distribution.
+
+### All dataset 
+
+```{r NASC-distribution}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = values), bins = 30, col = "white", lwd = 0.2) +
+  facet_rep_wrap(~ variable, scales = "free")
+```
+
+### All dataset - spatially averaged
+
+```{r spatial-average-NASC-distribution}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = values), bins = 30, col = "white", lwd = 0.2) +
+  facet_rep_wrap(~ variable, scales = "free")
+```
+
+### Transects 
+
+```{r transect-NASC-distribution}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")) %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = values), bins = 30, col = "white", lwd = 0.2) +
+  facet_rep_wrap(~ variable, scales = "free")
+```
+
+### Transects dataset - spatially averaged
+
+```{r spatial-average-transect-NASC-distribution}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = values), bins = 30, col = "white", lwd = 0.2) +
+  facet_rep_wrap(~ variable, scales = "free")
+```
+
+## Time series 
+
+High backscatter on July 15 associated with low inertia and shallow CM.
+
+### Boxplot {.tabset}
+
+#### All dataset
+
+```{r timeseries-boxplot, fig.width=9, fig.height=5}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = factor(yday), y = values)) + 
+  scale_x_discrete("Day of the year") +
+  scale_y_continuous("Backscatter") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-timeseries-boxplot, fig.width=9, fig.height=5}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = factor(yday), y = values)) + 
+  scale_x_discrete("Day of the year") +
+  scale_y_continuous("Backscatter") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
+```
+
+#### Transects
+
+```{r transect-timeseries-boxplot, fig.width=9, fig.height=5}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = factor(yday), y = values)) + 
+  scale_x_discrete("Day of the year") +
+  scale_y_continuous("Backscatter") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-timeseries-boxplot, fig.width=9, fig.height=5}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = factor(yday), y = values)) + 
+  scale_x_discrete("Day of the year") +
+  scale_y_continuous("Backscatter") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
+```
+
+### Scatter plot {.tabset}
+
+#### All dataset
+
+```{r timeseries-line, fig.width=9, fig.height=5}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = date, y = values), alpha = 0.15) + 
+  scale_x_datetime(date_breaks = "2 days", date_labels = "%d\n%b") +
+  scale_y_continuous("SA (dB re 1 m2 nmi-2)") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-timeseries-line, fig.width=9, fig.height=5}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = day, y = values), alpha = 0.15) + 
+  scale_x_date(date_breaks = "2 days", date_labels = "%d\n%b") +
+  scale_y_continuous("SA (dB re 1 m2 nmi-2)") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### Transects
+
+```{r transect-timeseries-line, fig.width=9, fig.height=5}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA, NASC_int, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int" ~ "NASC (m2 nmi-2)",
+                              variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = date, y = values), alpha = 0.15) + 
+  scale_x_datetime(date_breaks = "2 days", date_labels = "%d\n%b") +
+  scale_y_continuous("SA (dB re 1 m2 nmi-2)") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-timeseries-line, fig.width=9, fig.height=5}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, NASC_int_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "NASC_int_mean" ~ "NASC (m2 nmi-2)",
+                              variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = day, y = values), alpha = 0.15) + 
+  scale_x_date(date_breaks = "2 days", date_labels = "%d\n%b") +
+  scale_y_continuous("SA (dB re 1 m2 nmi-2)") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+## Spatial distribution 
+
+The black cross indicates the centre of the wind park from which distances are calculated.
+
+### Integrated S~A~. {.tabset}
+
+#### All dataset
+
+```{r SA-map}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  arrange(SA) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = SA)) +
+  scale_color_viridis_c("SA (dB re 1 m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated SA entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-SA-map}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  arrange(SA_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = SA_mean)) +
+  scale_color_viridis_c("SA (dB re 1 m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated SA entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects
+
+```{r transect-SA-map}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(SA) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = SA)) +
+  scale_color_viridis_c("SA (dB re 1 m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated SA entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-SA-map}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(SA_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = SA_mean)) +
+  scale_color_viridis_c("SA (dB re 1 m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated SA entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+### Integrated NASC {.tabset}
+
+#### All dataset
+
+```{r NASC-map}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  arrange(NASC_int) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = NASC_int)) +
+  scale_color_viridis_c("NASC (m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated NASC entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-NASC-map}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  arrange(NASC_int_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = NASC_int_mean)) +
+  scale_color_viridis_c("NASC (m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated NASC entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects
+
+```{r transect-NASC-map}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(NASC_int) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = NASC_int)) +
+  scale_color_viridis_c("NASC (m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated NASC entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-NASC-map}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(NASC_int_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = NASC_int_mean)) +
+  scale_color_viridis_c("SA (dB re 1 m2 nmi-2)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated NASC entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+### Mean S~V~ {.tabset}
+
+#### All dataset
+
+```{r Sv-map}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  arrange(Sv_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = Sv_mean)) +
+  scale_color_viridis_c("Sv (dB re 1 m-1)", option = "magma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated Sv entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-Sv-map}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  arrange(Sv_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = Sv_mean)) +
+  scale_color_viridis_c("Sv (dB re 1 m-1)", option = "viridis") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated Sv entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects
+
+```{r transect-Sv-map}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(Sv_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = Sv_mean)) +
+  scale_color_viridis_c("Sv (dB re 1 m-1)", option = "magma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime integrated Sv entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-Sv-map}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(Sv_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = Sv_mean)) +
+  scale_color_viridis_c("Sv (dB re 1 m-1)", option = "magma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime integrated Sv entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+
+### Centre of mass {.tabset}
+
+#### All dataset
+
+```{r CM-map}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  arrange(CM) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = CM)) +
+  scale_color_viridis_c("CM (m)", option = "rocket", direction = -1) +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime centre of mass entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-CM-map}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  arrange(CM_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = CM_mean)) +
+  scale_color_viridis_c("CM (m)", option = "rocket", direction = -1) +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime centre of mass entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects
+
+```{r transect-CM-map}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(CM) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = CM)) +
+  scale_color_viridis_c("CM (m)", option = "rocket", direction = -1) +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime centre of mass entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-CM-map}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(CM_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = CM_mean)) +
+  scale_color_viridis_c("CM (m)", option = "rocket", direction = -1) +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime centre of mass entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+### Inertia {.tabset}
+
+#### All dataset
+
+```{r inertia-map}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  arrange(inertia) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = inertia)) +
+  scale_color_viridis_c("Inertia (m-2)", option = "plasma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime inertia entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-inertia-map}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  arrange(inertia_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = inertia_mean)) +
+  scale_color_viridis_c("Inertia (m-2)", option = "plasma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime centre of mass entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects
+
+```{r transect-inertia-map}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  arrange(inertia) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = inertia)) +
+  scale_color_viridis_c("Inertia (m-2)", option = "plasma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle("Daytime inertia entire water column") +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-inertia-map}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+    arrange(inertia_mean) %>% 
+  ggplot() +
+  # Bathy
+  geom_raster(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+              aes(x = lon, y = lat, fill = depth), alpha = 0.7) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.7, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(data = subset(bathy, depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)),
+  aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Sailbuoy backscatter
+  geom_point(aes(x = lon, y = lat, col = inertia_mean)) +
+  scale_color_viridis_c("Inertia (m-2)", option = "plasma") +
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4) + 
+  scale_x_continuous(breaks = seq(-180, 180, 0.1)) +
+  scale_y_continuous(breaks = seq(-90, 90, 0.05)) +
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  ggtitle(paste0("Daytime inertia entire water column - ", cell_res_m, " m2")) +
+  guides(fill = "none") +
+  coord_quickmap(xlim = c(-1.5, -1.0), ylim = c(57.35, 57.65), expand = F) +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+
+## Distance to park
+
+### Sample count {.tabset}
+
+Number of samples with distance to park.
+
+#### All dataset
+
+```{r number-samples-distance}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  ggplot() +
+  geom_histogram(aes(x = dist_park_km), binwidth = 0.5, col = "white") + 
+  coord_cartesian(ylim = c(0, 40), xlim = c(0, 15))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-avaerage-number-samples-distance}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  ggplot() +
+  geom_histogram(aes(x = dist_park_km), binwidth = 0.5, col = "white") + 
+  coord_cartesian(ylim = c(0, 40), xlim = c(0, 15))
+```
+
+#### Transects
+
+```{r transect-number-samples-distance}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = dist_park_km), binwidth = 0.5, col = "white") + 
+  coord_cartesian(ylim = c(0, 40), xlim = c(0, 15))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-number-samples-distance}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  ggplot() +
+  geom_histogram(aes(x = dist_park_km), binwidth = 0.5, col = "white") + 
+  coord_cartesian(ylim = c(0, 40), xlim = c(0, 15))
+```
+
+### Scatterplot {.tabset}
+
+Scatterplots distance to park.
+
+#### All dataset
+
+```{r distance-park-scatter}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = dist_park_km, y = values), alpha = 0.25) + 
+  scale_x_continuous("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T)
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-distance-park-scatter}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = dist_park_km, y = values), alpha = 0.25) + 
+  scale_x_continuous("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T)
+```
+
+#### Transects
+
+```{r transect-distance-park-scatter}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = dist_park_km, y = values), alpha = 0.25) + 
+  scale_x_continuous("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T)
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-distance-park-scatter}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)")) %>% 
+  ggplot() + 
+  geom_point(aes(x = dist_park_km, y = values), alpha = 0.25) + 
+  scale_x_continuous("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T)
+```
+
+### Boxplot {.tabset}
+
+Boxplot over distance to park.
+
+#### All dataset 
+
+```{r distance-park-boxplot, fig.width=9, fig.height=5}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)"), 
+         dist_park_km_factor = cut(dist_park_km, seq(0, 50, 1))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = dist_park_km_factor, y = values)) + 
+  scale_x_discrete("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### All dataset - spatially averaged
+
+```{r spatial-average-distance-park-boxplot, fig.width=9, fig.height=5}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)"), 
+         dist_park_km_factor = cut(dist_park_km, seq(0, 50, 1))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = dist_park_km_factor, y = values)) + 
+  scale_x_discrete("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### Transect dataset
+
+```{r transect-distance-park-boxplot, fig.width=9, fig.height=5}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)"), 
+         dist_park_km_factor = cut(dist_park_km, seq(0, 50, 1))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = dist_park_km_factor, y = values)) + 
+  scale_x_discrete("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+#### Transects - spatially averaged
+
+```{r spatial-average-transect-distance-park-boxplot, fig.width=9, fig.height=5}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)"), 
+         dist_park_km_factor = cut(dist_park_km, seq(0, 50, 1))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = dist_park_km_factor, y = values)) + 
+  scale_x_discrete("Distance to park (km)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+
+## Bottom depth {.tabset}
+
+Boxplot over distance to park.
+
+### All dataset 
+
+```{r bottom-depth-boxplot, fig.width=9, fig.height=5}
+SB_int %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)"), 
+         bottom_depth_factor = cut(bottom_depth, seq(0, 150, 5))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = bottom_depth_factor, y = values)) + 
+  scale_x_discrete("Bottom depth (m)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+### All dataset - spatially averaged
+
+```{r spatial-average-bottom-depth-boxplot, fig.width=9, fig.height=5}
+SB_int_mean %>% 
+  filter(day_night == "day") %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)"), 
+         bottom_depth_factor = cut(bottom_depth_mean, seq(0, 150, 5))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = bottom_depth_factor, y = values)) + 
+  scale_x_discrete("Bottom depth (m)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+### Transect dataset
+
+```{r transect-bottom-depth-boxplot, fig.width=9, fig.height=5}
+SB_int_transect %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA, Sv_mean, CM, inertia), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM" ~ "CM (m)",
+                              variable == "inertia" ~ "Inertia (m-2)"), 
+         bottom_depth_factor = cut(bottom_depth, seq(0, 150, 5))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = bottom_depth_factor, y = values)) + 
+  scale_x_discrete("Bottom depth (m)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+### Transects - spatially averaged
+
+```{r spatial-average-transect-bottom-depth-boxplot, fig.width=9, fig.height=5}
+SB_int_transect_mean %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22", "T23")) %>% 
+  pivot_longer(c(SA_mean, Sv_mean, CM_mean, inertia_mean), names_to = "variable", values_to = "values") %>% 
+  mutate(variable = case_when(variable == "SA_mean" ~ "SA (dB re 1 m2 nmi-2)",
+                              variable == "Sv_mean" ~ "Sv (dB re 1 m-1)",
+                              variable == "CM_mean" ~ "CM (m)",
+                              variable == "inertia_mean" ~ "Inertia (m-2)"), 
+         bottom_depth_factor = cut(bottom_depth_mean, seq(0, 150, 5))) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = bottom_depth_factor, y = values)) + 
+  scale_x_discrete("Bottom depth (m)") +
+  scale_y_continuous("Value") + 
+  facet_rep_wrap(~ variable, scales = "free_y", repeat.tick.labels = T) +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+# What patterns?
+
+## Generalized additive models (GAMs) {.tabset}
+
+Generalized additive models (GAM; Wood 2017) were fitted to test whether integrated backscatter (proxy for density) changed in relation to the distance to the wind park. I excluded some data which had not enough samples based on the following criteria:
+
+- distance to park: less than 8 km (> 5 samples per 1 km distance bin)
+- bottom depth: more than 90 m (> 5 samples per 5 m bottom depth bin)
+
+```{r SA-GAM-select-day}
+SB_day <- SB_int_transect %>% 
+  mutate(week = week(day)) %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")) %>% 
+  filter(dist_park_km <= 8 & bottom_depth >= 90) %>%
+  filter(transect != "T23") 
+```
+
+### Distance to park 
+
+```{r}
+plotly::ggplotly(
+  SB_int_transect %>% 
+    filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")) %>% 
+    ggplot() +
+    geom_histogram(aes(x = dist_park_km), binwidth = 1, col = "white") + 
+    geom_hline(yintercept = 5, col = "black", lty = 2) +
+    geom_vline(xintercept = 8.5, col = "red", lty = 2)
+  )
+```
+
+### Bottom depth
+
+```{r}
+plotly::ggplotly(
+  SB_int_transect %>% 
+    filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")) %>% 
+    ggplot() +
+    geom_histogram(aes(x = bottom_depth), binwidth = 5, col = "white") + 
+    geom_hline(yintercept = 5, col = "black", lty = 2) +
+    geom_vline(xintercept = 87.5, col = "red", lty = 2)
+    # coord_cartesian(ylim = c(0, 40), xlim = c(0, 15))
+  )
+```
+
+## GAM: Integrated S~A~
+
+Plot S~A~ in relation to distance to park per transect.
+
+```{r SA-dist-facet, fig.width=9, fig.height=7}
+SB_day %>% 
+  ggplot() + 
+  geom_line(aes(x = dist_park_km, y = SA, col = transect)) + 
+  facet_rep_wrap(~ transect, repeat.tick.labels = T) +
+  theme(legend.position = "none")
+```
+
+### GAM fitting
+
+Fit multiple model structures:
+
+- mod1.1: S~A~ ~ s(dist_park_km)
+- mod1.2: S~A~ ~ s(dist_park_km) + s(bottom_depth)
+- mod1.5: S~A~ ~ s(dist_park_km) + s(transect)
+- mod1.6: S~A~ ~ s(dist_park_km) + s(bottom_depth) + s(transect)
+- mod1.7: S~A~ ~ s(dist_park_km) + s(yday)
+- mod1.8: S~A~ ~ s(dist_park_km) + s(yday) + s(transect)
+- mod1.9: S~A~ ~ s(dist_park_km) + s(bottom_depth) + s(yday) + s(transect)
+- mod1.10: S~A~ ~ s(dist_park_km) + s(week)
+- mod1.11: S~A~ ~ s(dist_park_km) + s(week as factor) + s(transect)
+- mod1.12: S~A~ ~ s(dist_park_km) + s(bottom_depth) + s(week as factor) + s(transect)
+
+```{r SA-GAM-structure, warning=FALSE}
+# mod1.1: SA ~ s(dist_park_km)
+gam_m1.1 <- gam(SA ~ 
+                  s(dist_park_km, bs = "tp", k = 20), # Thin plate spline
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.2: SA ~ s(dist_park_km) + s(bottom_depth)
+gam_m1.2 <- gam(SA ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20), # Thin plate spline
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# # mod1.3: SA ~ s(dist_park_km) + transect
+# gam_m1.3 <- gam(SA ~ 
+#                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+#                   transect, # Fixed effect transect
+#                 family = "gaussian",
+#                 method = "REML",
+#                 data = SB_day)
+# # mod1.4: SA ~ s(dist_park_km) + s(bottom_depth) + transect
+# gam_m1.4 <- gam(SA ~ 
+#                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+#                   s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+#                   transect, # Fixed effect transect
+#                 family = "gaussian",
+#                 method = "REML",
+#                 data = SB_day)
+# mod1.5: SA ~ s(dist_park_km) + s(transect)
+gam_m1.5 <- gam(SA ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.6: SA ~ s(dist_park_km) + s(bottom_depth) + s(transect)
+gam_m1.6 <- gam(SA ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.7: SA ~ s(dist_park_km) + s(yday)
+gam_m1.7 <- gam(SA ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(yday, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.8: SA ~ s(dist_park_km) + s(yday) + s(transect)
+gam_m1.8 <- gam(SA ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(yday, bs = "re") + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.9: SA ~ s(dist_park_km) + s(bottom_depth) + s(yday) + s(transect)
+gam_m1.9 <- gam(SA ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                  s(yday, bs = "re") + # Random effect
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod1.10: SA ~ s(dist_park_km) + s(week)
+gam_m1.10 <- gam(SA ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(week, bs = "re"), # Random effect
+                 family = "gaussian",
+                 method = "REML",
+                 data = SB_day)
+# mod1.11: SA ~ s(dist_park_km) + s(week) + s(transect)
+gam_m1.11 <- gam(SA ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(week, bs = "re") + # Random effect
+                   s(transect, bs = "re"), # Random effect
+                 family = "gaussian",
+                 method = "REML",
+                 data = SB_day)
+# mod1.12: SA ~ s(dist_park_km) + s(bottom_depth) + s(week) + s(transect)
+gam_m1.12 <- gam(SA ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                   s(week, bs = "re") + # Random effect
+                   s(transect, bs = "re"), # Random effect
+                 family = "gaussian",
+                 method = "REML",
+                 data = SB_day)
+```
+
+### GAM comparison
+
+Comparison of GAM SA models. Model `gam_m1.6` fits best which includes `distance to park`, `bottom depth`, and `transect` – it has the best AIC scores, the highest deviance explained and one of the lowest REML score.
+
+```{r SA-GAM-comparison, message=FALSE}
+# Summary metric
+mod1_AIC <- AIC(gam_m1.1, 
+                gam_m1.2,
+                # gam_m1.3, 
+                # gam_m1.4,
+                gam_m1.5,
+                gam_m1.6,
+                gam_m1.7,
+                gam_m1.8,
+                gam_m1.9,
+                gam_m1.10,
+                gam_m1.11,
+                gam_m1.12
+                ) %>% 
+  rownames_to_column() %>%
+  rename(model = rowname)
+
+# Metrics data frame
+data.frame(
+  model = c("gam_m1.1",
+            "gam_m1.2",
+            # "gam_m1.3", 
+            # "gam_m1.4",
+            "gam_m1.5",
+            "gam_m1.6",
+            "gam_m1.7",
+            "gam_m1.8",
+            "gam_m1.9",
+            "gam_m1.10",
+            "gam_m1.11",
+            "gam_m1.12"
+            ),
+  formula = c("SA ~ s(dist)",
+              "SA ~ s(dist) + s(bottom_depth)", 
+              # "SA ~ s(dist) + transect", 
+              # "SA ~ s(dist) + s(bottom_depth) + transect",
+              "SA ~ s(dist) + s(transect)",
+              "SA ~ s(dist) + s(bottom_depth) + s(transect)",
+              "SA ~ s(dist) + s(yday)",
+              "SA ~ s(dist) + s(yday) + s(transect)",
+              "SA ~ s(dist) + s(bottom_depth) + s(yday) + s(transect)",
+              "SA ~ s(dist) + s(week)",
+              "SA ~ s(dist) + s(week) + s(transect)",
+              "SA ~ s(dist) + s(bottom_depth) + s(week) + s(transect)"
+              ),
+  reml = round(c(gam_m1.1$gcv.ubre, 
+                 gam_m1.2$gcv.ubre, 
+                 # gam_m1.3$gcv.ubre, 
+                 # gam_m1.4$gcv.ubre,
+                 gam_m1.5$gcv.ubre,
+                 gam_m1.6$gcv.ubre,
+                 gam_m1.7$gcv.ubre,
+                 gam_m1.8$gcv.ubre,
+                 gam_m1.9$gcv.ubre,
+                 gam_m1.10$gcv.ubre,
+                 gam_m1.11$gcv.ubre,
+                 gam_m1.12$gcv.ubre
+                 ), 
+               2), 
+  dev_expl = round(c((1 - (gam_m1.1$deviance / gam_m1.1$null.deviance)) * 100,
+                     (1 - (gam_m1.2$deviance / gam_m1.2$null.deviance)) * 100,
+                     # (1 - (gam_m1.3$deviance / gam_m1.3$null.deviance)) * 100,
+                     # (1 - (gam_m1.4$deviance / gam_m1.4$null.deviance)) * 100,
+                     (1 - (gam_m1.5$deviance / gam_m1.5$null.deviance)) * 100,
+                     (1 - (gam_m1.6$deviance / gam_m1.6$null.deviance)) * 100,
+                     (1 - (gam_m1.7$deviance / gam_m1.7$null.deviance)) * 100,
+                     (1 - (gam_m1.8$deviance / gam_m1.8$null.deviance)) * 100,
+                     (1 - (gam_m1.9$deviance / gam_m1.9$null.deviance)) * 100,
+                     (1 - (gam_m1.10$deviance / gam_m1.10$null.deviance)) * 100,
+                     (1 - (gam_m1.11$deviance / gam_m1.11$null.deviance)) * 100,
+                     (1 - (gam_m1.12$deviance / gam_m1.12$null.deviance)) * 100
+                     ),
+                   2),
+  r2 = round(c(summary(gam_m1.1)$r.sq,
+               summary(gam_m1.2)$r.sq,
+               # summary(gam_m1.3)$r.sq,
+               # summary(gam_m1.4)$r.sq,
+               summary(gam_m1.5)$r.sq,
+               summary(gam_m1.6)$r.sq,
+               summary(gam_m1.7)$r.sq,
+               summary(gam_m1.8)$r.sq,
+               summary(gam_m1.9)$r.sq,
+               summary(gam_m1.10)$r.sq,
+               summary(gam_m1.11)$r.sq,
+               summary(gam_m1.12)$r.sq
+               ),
+             2)) %>%
+  left_join(., mod1_AIC) %>% 
+  mutate(df = round(df, 3),
+         AIC = round(AIC, 3),
+         dAIC = round(AIC - min(AIC), 2)) %>%
+  dplyr::select(model, formula, df, dev_expl, r2, reml, AIC, dAIC) %>%
+  arrange(AIC) %>% 
+  DT::datatable(class = "cell-border stribe", rownames = F)
+```
+
+Plot partial effects of `gam_m1.6`. The partial effect of distance to park shows a slight increase with distance to the park. Similarly, backscatter increases with increasing bottom depth although the spline is more wobbly with two peaks in backscatter at 105 and 115 m bottom depth.
+
+```{r SA-GAM-partial-effects}
+# draw(gam_m1.1, scales = "fixed")
+# draw(gam_m1.2, scales = "fixed")
+# draw(gam_m1.3, scales = "fixed")
+# draw(gam_m1.4, scales = "fixed")
+# draw(gam_m1.5, scales = "fixed")
+draw(gam_m1.6, scales = "fixed")
+# draw(gam_m1.7, scales = "fixed")
+# draw(gam_m1.8, scales = "fixed")
+# draw(gam_m1.9, scales = "fixed")
+# draw(gam_m1.10, scales = "fixed")
+# draw(gam_m1.11, scales = "fixed")
+# draw(gam_m1.12, scales = "fixed")
+```
+
+Summary of `gam_m1.6`. Distance to park is not significant while bottom depth is.
+
+```{r SA-GAM-summary}
+# summary(gam_m1.1)
+# summary(gam_m1.2)
+# summary(gam_m1.3)
+# summary(gam_m1.4)
+# summary(gam_m1.5)
+summary(gam_m1.6)
+# summary(gam_m1.7)
+# summary(gam_m1.8)
+# summary(gam_m1.9)
+# summary(gam_m1.10)
+# summary(gam_m1.11)
+# summary(gam_m1.12)
+```
+
+### Verify GAM fitting
+
+Residual distribution looks good.
+
+```{r SA-GAM-appraise}
+# appraise(gam_m1.1)
+# appraise(gam_m1.2)
+# appraise(gam_m1.3)
+# appraise(gam_m1.4)
+# appraise(gam_m1.5)
+appraise(gam_m1.6)
+# appraise(gam_m1.7)
+# appraise(gam_m1.8)
+# appraise(gam_m1.9)
+# appraise(gam_m1.10)
+# appraise(gam_m1.11)
+# appraise(gam_m1.12)
+```
+
+Plot residuals against covariates. There are no patterns left in the residuals for bottom depth and distance to park. However, transect `T02-2` which occurred on June 26th (yday 177) deviates from the other transects. There is some unexplained variance left in this transect. 
+
+```{r SA-GAM-residuals-covariates, message=FALSE, fig.width=9}
+# Extract residuals
+gam_m1.6_resid <- bind_cols(SB_day, residuals.gam(gam_m1.6)) %>% 
+  rename(resid = last_col()) %>% 
+  mutate(sign = factor(if_else(sign(resid) == 1, "positive", "negative")))
+
+# Plot residuals against covariates
+plot_grid(
+  gam_m1.6_resid %>%
+    pivot_longer(c(dist_park_km, bottom_depth), names_to = "variable", values_to = "values") %>% 
+    ggplot(aes(x = values, y = resid)) + 
+    geom_hline(yintercept = 0, col = "red") +
+    geom_point(size = 1, alpha = 0.25) + 
+    facet_rep_wrap(~ variable, scales = "free_x", repeat.tick.labels = T),
+  plot_grid(
+    gam_m1.6_resid %>%
+      ggplot(aes(x = transect, y = resid)) + 
+      geom_boxplot() + 
+      geom_hline(yintercept = 0, col = "red") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5)),
+    gam_m1.6_resid %>%
+      mutate(yday = factor(yday)) %>% 
+      ggplot(aes(x = yday, y = resid)) + 
+      geom_boxplot() + 
+      geom_hline(yintercept = 0, col = "red"),
+    ncol = 2, align = "h"),  
+  ncol = 1)
+```
+
+Plot residuals spatially (the black cross indicates the centre of the wind park from which distance are calculated). No sign of strong spatial patterns in residuals.
+
+```{r SA-GAM-residuals-map}
+bathy %>%
+  filter(depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)) %>%
+  ggplot() +
+  # Bathy
+  geom_raster(aes(x = lon, y = lat, fill = depth), alpha = 0.5) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.5, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Residuals
+  geom_point(data = gam_m1.6_resid, aes(x = lon, y = lat, col = sign, size = abs(resid)), alpha = 0.5) +
+  scale_size(range = c(1, 5)) + 
+  scale_color_manual(values = c("blue", "red")) + 
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4, size = 2, stroke = 2) + 
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  coord_quickmap(xlim = c(-1.5, -1.2), ylim = c(57.42, 57.55), expand = F) +
+  guides(fill = "none") + 
+  theme(legend.key.height = unit(0.3, "in"),
+        legend.key.width = unit(0.2, "in"),
+        axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+### Model penalization
+
+I penalize the model to verify that all variables are important in the model (see Marra and Wood 2011). Distance to park has been shrunk toward zero. Hence it could be removed from the model.
+
+```{r SA-GAM-penalized}
+# mod1.6: SA ~ s(dist_park_km) + s(bottom_depth) + s(transect)
+gam_m1.6_pen <- gam(SA ~ 
+                      s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                      s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                      s(transect, bs = "re"), # Random effect
+                    select = T,
+                    family = "gaussian",
+                    method = "REML",
+                    data = SB_day)
+draw(gam_m1.6_pen, scales = "fixed")
+summary(gam_m1.6_pen)
+appraise(gam_m1.6_pen)
+```
+
+## GAM: Centre of mass
+
+Plot centre of mass in relation to distance to park per transect.
+
+```{r CM-dist-facet, fig.width=9, fig.height=7}
+SB_day %>% 
+  ggplot() + 
+  geom_line(aes(x = dist_park_km, y = CM, col = transect)) + 
+  facet_rep_wrap(~ transect, repeat.tick.labels = T) +
+  theme(legend.position = "none")
+```
+
+### GAM fitting
+
+Fit multiple model structures:
+
+- mod2.1: CM ~ s(dist_park_km)
+- mod2.2: CM ~ s(dist_park_km) + s(bottom_depth)
+- mod2.5: CM ~ s(dist_park_km) + s(transect)
+- mod2.6: CM ~ s(dist_park_km) + s(bottom_depth) + s(transect)
+- mod2.7: CM ~ s(dist_park_km) + s(sun_angle)
+- mod2.8: CM ~ s(dist_park_km) + s(sun_angle) + s(transect)
+- mod2.9: CM ~ s(dist_park_km) + s(bottom_depth) + s(sun_angle) + s(transect)
+- mod2.10: CM ~ s(dist_park_km) + s(sun_angle) + s(yday)
+- mod2.11: CM ~ s(dist_park_km) + s(sun_angle) + s(yday) + s(transect)
+- mod2.12: CM ~ s(dist_park_km) + s(bottom_depth) + s(sun_angle) + s(yday) + s(transect)
+
+```{r CM-GAM-structure, warning=FALSE}
+# mod2.1: CM ~ s(dist_park_km)
+gam_m2.1 <- gam(CM ~ 
+                  s(dist_park_km, bs = "tp", k = 20), # Thin plate spline
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.2: CM ~ s(dist_park_km) + s(bottom_depth)
+gam_m2.2 <- gam(CM ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20), # Thin plate spline
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# # mod2.3: CM ~ s(dist_park_km) + transect
+# gam_m2.3 <- gam(CM ~ 
+#                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+#                   transect, # Fixed effect transect
+#                 family = "gaussian",
+#                 method = "REML",
+#                 data = SB_day)
+# # mod2.4: CM ~ s(dist_park_km) + s(bottom_depth) + transect
+# gam_m2.4 <- gam(CM ~ 
+#                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+#                   s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+#                   transect, # Fixed effect transect
+#                 family = "gaussian",
+#                 method = "REML",
+#                 data = SB_day)
+# mod2.5: CM ~ s(dist_park_km) + s(transect)
+gam_m2.5 <- gam(CM ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.6: CM ~ s(dist_park_km) + s(bottom_depth) + s(transect)
+gam_m2.6 <- gam(CM ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.7: CM ~ s(dist_park_km) + s(sun_angle)
+gam_m2.7 <- gam(CM ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(sun_angle_deg, bs = "tp", k = 20), # Thin plate spline
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.8: CM ~ s(dist_park_km) + s(sun_angle) + s(transect)
+gam_m2.8 <- gam(CM ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(sun_angle_deg, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.9: CM ~ s(dist_park_km) + s(bottom_depth) + s(sun_angle) + s(transect)
+gam_m2.9 <- gam(CM ~
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                  s(sun_angle_deg, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+# mod2.10: CM ~  s(dist_park_km) + s(sun_angle) + s(yday)
+gam_m2.10 <- gam(CM ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(sun_angle_deg, bs = "tp", k = 20) + # Thin plate spline
+                   s(yday, bs = "re"), # Random effect
+                 method = "REML",
+                 data = SB_day)
+# mod2.11: CM ~ s(dist_park_km) + s(sun_angle) + s(yday) + s(transect)
+gam_m2.11 <- gam(CM ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(sun_angle_deg, bs = "tp", k = 20) + # Thin plate spline
+                   s(yday, bs = "re") + # Random effect
+                   s(transect, bs = "re"), # Random effect
+                 family = "gaussian",
+                 method = "REML",
+                 data = SB_day)
+# mod2.12: CM ~ s(dist_park_km) + s(bottom_depth) + s(sun_angle) + s(yday) + s(transect)
+gam_m2.12 <- gam(CM ~
+                   s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                   s(bottom_depth, bs = "tp", k = 20) + # Thin plate spline
+                   s(sun_angle_deg, bs = "tp", k = 20) + # Thin plate spline
+                   s(yday, bs = "re") + # Random effect
+                   s(transect, bs = "re"), # Random effect
+                 family = "gaussian",
+                 method = "REML",
+                 data = SB_day)
+```
+
+### GAM comparison
+
+Comparison of GAM CM models. Model `gam_m2.5` fits best which includes `distance to park` and `transect` – it has the best AIC score, one of the highest deviance explained, and a low REML score.
+
+```{r CM-GAM-comparison, message=FALSE}
+# Summary metric
+mod2_AIC <- AIC(gam_m2.1, 
+                gam_m2.2,
+                # gam_m2.3, 
+                # gam_m2.4,
+                gam_m2.5,
+                gam_m2.6,
+                gam_m2.7,
+                gam_m2.8,
+                gam_m2.9,
+                gam_m2.10,
+                gam_m2.11,
+                gam_m2.12
+                ) %>% 
+  rownames_to_column() %>%
+  rename(model = rowname)
+
+# Metrics data frame
+data.frame(
+  model = c("gam_m2.1",
+            "gam_m2.2",
+            # "gam_m2.3", 
+            # "gam_m2.4",
+            "gam_m2.5",
+            "gam_m2.6",
+            "gam_m2.7",
+            "gam_m2.8",
+            "gam_m2.9",
+            "gam_m2.10",
+            "gam_m2.11",
+            "gam_m2.12"
+            ),
+  formula = c("CM ~ s(dist)",
+              "CM ~ s(dist) + s(bottom_depth)", 
+              # "CM ~ s(dist) + transect", 
+              # "CM ~ s(dist) + s(bottom_depth) + transect",
+              "CM ~ s(dist) + s(transect)",
+              "CM ~ s(dist) + s(bottom_depth) + s(transect)",
+              "CM ~ s(dist) + s(sun_angle)",
+              "CM ~ s(dist) + s(sun_angle) + s(transect)",
+              "CM ~ s(dist) + s(bottom_depth) + s(sun_angle) + s(transect)",
+              "CM ~ s(dist) + s(sun_angle)  + s(yday)",
+              "CM ~ s(dist) + s(sun_angle)  + s(yday) + s(transect)",
+              "CM ~ s(dist)  + s(sun_angle) + s(bottom_depth) + s(yday) + s(transect)"
+              ),
+  reml = round(c(gam_m2.1$gcv.ubre, 
+                 gam_m2.2$gcv.ubre, 
+                 # gam_m2.3$gcv.ubre, 
+                 # gam_m2.4$gcv.ubre,
+                 gam_m2.5$gcv.ubre,
+                 gam_m2.6$gcv.ubre,
+                 gam_m2.7$gcv.ubre,
+                 gam_m2.8$gcv.ubre,
+                 gam_m2.9$gcv.ubre,
+                 gam_m2.10$gcv.ubre,
+                 gam_m2.11$gcv.ubre,
+                 gam_m2.12$gcv.ubre
+                 ), 
+               2), 
+  dev_expl = round(c((1 - (gam_m2.1$deviance / gam_m2.1$null.deviance)) * 100,
+                     (1 - (gam_m2.2$deviance / gam_m2.2$null.deviance)) * 100,
+                     # (1 - (gam_m2.3$deviance / gam_m2.3$null.deviance)) * 100,
+                     # (1 - (gam_m2.4$deviance / gam_m2.4$null.deviance)) * 100,
+                     (1 - (gam_m2.5$deviance / gam_m2.5$null.deviance)) * 100,
+                     (1 - (gam_m2.6$deviance / gam_m2.6$null.deviance)) * 100,
+                     (1 - (gam_m2.7$deviance / gam_m2.7$null.deviance)) * 100,
+                     (1 - (gam_m2.8$deviance / gam_m2.8$null.deviance)) * 100,
+                     (1 - (gam_m2.9$deviance / gam_m2.9$null.deviance)) * 100,
+                     (1 - (gam_m2.10$deviance / gam_m2.10$null.deviance)) * 100,
+                     (1 - (gam_m2.11$deviance / gam_m2.11$null.deviance)) * 100,
+                     (1 - (gam_m2.12$deviance / gam_m2.12$null.deviance)) * 100
+                     ),
+                   2),
+  r2 = round(c(summary(gam_m2.1)$r.sq,
+               summary(gam_m2.2)$r.sq,
+               # summary(gam_m2.3)$r.sq,
+               # summary(gam_m2.4)$r.sq,
+               summary(gam_m2.5)$r.sq,
+               summary(gam_m2.6)$r.sq,
+               summary(gam_m2.7)$r.sq,
+               summary(gam_m2.8)$r.sq,
+               summary(gam_m2.9)$r.sq,
+               summary(gam_m2.10)$r.sq,
+               summary(gam_m2.11)$r.sq,
+               summary(gam_m2.12)$r.sq
+               ),
+             2)) %>%
+  left_join(., mod2_AIC) %>% 
+  mutate(df = round(df, 3),
+         AIC = round(AIC, 3),
+         dAIC = round(AIC - min(AIC), 2)) %>%
+  dplyr::select(model, formula, df, dev_expl, r2, reml, AIC, dAIC) %>%
+  arrange(AIC) %>% 
+  DT::datatable(class = "cell-border stribe", rownames = F)
+```
+
+Plot partial effects of `gam_m2.5`. The partial effect of distance to park showed a deepening of the centre of mass of the entire water column up to two kilometers around the wind park, with the shallowest centre of mass reached at 4.5 km away from the windpark. Past 4.5 km, the centre of mass deepened again.  
+
+```{r CM-GAM-partial-effects}
+# draw(gam_m2.1, scales = "fixed")
+# draw(gam_m2.2, scales = "fixed")
+# draw(gam_m2.3, scales = "fixed")
+# draw(gam_m2.4, scales = "fixed")
+draw(gam_m2.5, scales = "fixed")
+# draw(gam_m2.6, scales = "fixed")
+# draw(gam_m2.7, scales = "fixed")
+# draw(gam_m2.8, scales = "fixed")
+# draw(gam_m2.9, scales = "fixed")
+# draw(gam_m2.10, scales = "fixed")
+# draw(gam_m2.11, scales = "fixed")
+# draw(gam_m2.12, scales = "fixed")
+```
+
+Summary of `gam_m2.5`. Distance to park is significant.
+
+```{r CM-GAM-summary}
+# summary(gam_m2.1)
+# summary(gam_m2.2)
+# summary(gam_m2.3)
+# summary(gam_m2.4)
+summary(gam_m2.5)
+# summary(gam_m2.6)
+# summary(gam_m2.7)
+# summary(gam_m2.8)
+# summary(gam_m2.9)
+# summary(gam_m2.10)
+# summary(gam_m2.11)
+# summary(gam_m2.12)
+```
+
+### Verify GAM fitting
+
+Residual distribution looks good.
+
+```{r CM-GAM-appraise}
+# appraise(gam_m2.1)
+# appraise(gam_m2.2)
+# appraise(gam_m2.3)
+# appraise(gam_m2.4)
+appraise(gam_m2.5)
+# appraise(gam_m2.6)
+# appraise(gam_m2.7)
+# appraise(gam_m2.8)
+# appraise(gam_m2.9)
+# appraise(gam_m2.10)
+# appraise(gam_m2.11)
+# appraise(gam_m2.12)
+```
+
+Plot residuals against covariates. There are no patterns left in the residuals for bottom depth and distance to park. However, transect `T21-2` which occurred on July 23rd (yday 204) deviates from the other transects. There is some unexplained variance left in this transect. 
+
+```{r CM-GAM-residuals-covariates, message=FALSE, fig.width=9}
+# Extract residuals
+gam_m2.5_resid <- bind_cols(SB_day, residuals.gam(gam_m2.5)) %>% 
+  rename(resid = last_col()) %>% 
+  mutate(sign = factor(if_else(sign(resid) == 1, "positive", "negative")))
+
+# Plot residuals against covariates
+plot_grid(
+  gam_m2.5_resid %>%
+    pivot_longer(c(dist_park_km, bottom_depth), names_to = "variable", values_to = "values") %>% 
+    ggplot(aes(x = values, y = resid)) + 
+    geom_hline(yintercept = 0, col = "red") +
+    geom_point(size = 1, alpha = 0.25) + 
+    facet_rep_wrap(~ variable, scales = "free_x", repeat.tick.labels = T),
+  plot_grid(
+    gam_m2.5_resid %>%
+      ggplot(aes(x = transect, y = resid)) + 
+      geom_boxplot() + 
+      geom_hline(yintercept = 0, col = "red") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5)),
+    gam_m2.5_resid %>%
+      mutate(yday = factor(yday)) %>% 
+      ggplot(aes(x = yday, y = resid)) + 
+      geom_boxplot() + 
+      geom_hline(yintercept = 0, col = "red"),
+    ncol = 2, align = "h"),  
+  ncol = 1)
+```
+
+Plot residuals spatially (the black cross indicates the centre of the wind park from which distance are calculated). No sign of strong spatial patterns in residuals.
+
+```{r CM-GAM-residuals-map}
+bathy %>%
+  filter(depth < 0 & between(lon, -1.5, -1.0) & between(lat, 57.35, 57.65)) %>%
+  ggplot() +
+  # Bathy
+  geom_raster(aes(x = lon, y = lat, fill = depth), alpha = 0.5) +
+  scale_fill_cmocean("Depth (m)", name = "deep", discrete = F, direction = -1, alpha = 0.5, breaks = seq(0, -200, -10), labels = abs(seq(0, -200, -10))) +
+  # 100 m isobath
+  geom_contour(aes(x = lon, y = lat, z = depth), breaks = c(-100), linewidth = 0.2, col = "white", alpha = 1) +
+  # Residuals
+  geom_point(data = gam_m2.5_resid, aes(x = lon, y = lat, col = sign, size = abs(resid)), alpha = 0.5) +
+  scale_size(range = c(1, 5)) + 
+  scale_color_manual(values = c("blue", "red")) + 
+  # Wind park
+  geom_polygon(data = coord_park, aes(x = lon, y = lat), fill = NA, col = "black", linewidth = 1) +
+  geom_point(aes(x = -1.3562, y = 57.48708), pch = 4, size = 2, stroke = 2) + 
+  labs(x = "Longitude (°E)", y = "Latitude (°N)") +
+  coord_quickmap(xlim = c(-1.5, -1.2), ylim = c(57.42, 57.55), expand = F) +
+  guides(fill = "none") + 
+  theme(legend.key.height = unit(0.3, "in"),
+        legend.key.width = unit(0.2, "in"),
+        axis.line = element_blank(),
+        panel.border = element_rect(linewidth = 1, fill = NA))
+```
+
+### Model penalization
+
+Penalize model to verify that all variables are important in the model (see Marra and Wood 2011). Distance was not shrunk toward zero and can thus not be removed from the model.
+
+```{r CM-GAM-penalized}
+# mod2.5: CM ~ s(dist_park_km) + s(transect)
+gam_m2.5_pen <- gam(CM ~ 
+                  s(dist_park_km, bs = "tp", k = 20) + # Thin plate spline
+                  s(transect, bs = "re"), # Random effect
+                select = T, 
+                family = "gaussian",
+                method = "REML",
+                data = SB_day)
+draw(gam_m2.5_pen, scales = "fixed")
+summary(gam_m2.5_pen)
+appraise(gam_m2.5_pen)
+```
+
+## Summary of patterns observed
+
+We did not find significant effect of the windpark on the integrated backscatter over the entire water column. However, the windpark had an effect on the centre of mass, i.e., the weighted mean depth of the backscatter found in the water column, where the centre of mass was the shallowest at 4.5 km of the wind park and deepened close to the wind park (< 2 km).
+
+# Investigate potential cause of the change in centre of mass
+
+The change in centre of mass in relation to the windpark can be caused by changes in the vertical distribution of backscatter along the distance gradient. To investigate this, I check the vertical distribution of S~V~.
+
+First, I select data following the same criteria as for the GAMs.
+
+- distance to park: less than 8 km (> 5 samples per 1 km distance bin)
+- bottom depth: more than 90 m (> 5 samples per 5 m bottom depth bin)
+
+```{r Sv-select-day}
+SB_day_depth <- SB_tidy_transect %>% 
+  mutate(week = week(day)) %>% 
+  filter(day_night == "day" & !transect %in% c("T01", "T06", "T17", "T19", "T22")) %>% 
+  filter(dist_park_km <= 8 & bottom_depth >= 90) %>%
+  filter(transect != "T23") 
+```
+
+
+## S~V~ profiles per 1 km distance intervals {.tabset}
+
+First, I calculate the average S~V~ profile per 1 km distance away from the farm per transect. S~V~ profiles with a minimum plotting threshold of -80 dB re 1 m-1. The backscatter below those levels is very low and can thus be considered as depauperate of scatterers.
+
+```{r Sv-profiles-transects-summary, message=FALSE}
+SB_day_depth_transect <- SB_day_depth %>% 
+  # Discretize distance in 500 m intervals
+  mutate(dist_park_km_factor = cut(dist_park_km, seq(0, 8, 1))) %>% 
+  # Calculate mean sv per depth bin
+  group_by(transect, dist_park_km_factor, depth_min) %>% 
+  summarise(sv_lin_mean = mean(sv_lin)) %>% 
+  ungroup() %>% 
+  # Calculate Sv in dB
+  mutate(Sv_mean = 10 * log10(sv_lin_mean), 
+         depth = depth_min + 5) %>% 
+  # Create unique ID for plotting
+  unite(ID, transect, dist_park_km_factor, remove = F)
+```
+
+Sv profiles per 1 km distance for all transects
+
+```{r Sv-profile-transects-distance, echo=FALSE, fig.height=5, fig.width=4, results='asis'}
+# Loop to create taps with Sv profiles
+for(tab in sort(unique(SB_day_depth_transect$dist_park_km_factor))) {
+  # Tabs
+  cat("\n")
+  cat("### ", tab, "   \n")
+  cat("\n")
+  # Create Sv profile plot per transect per distance category
+  print(SB_day_depth_transect %>% 
+          filter(dist_park_km_factor == tab) %>%
+          ggplot() + 
+          geom_vline(xintercept = -80, lty = 2) + 
+          geom_point(aes(x = Sv_mean, y = depth, group = ID, color = transect), alpha = 0.5) +
+          geom_path(aes(x = Sv_mean, y = depth, group = ID, color = transect)) +
+          scale_color_viridis_d("transect", option = "plasma", end = 0.9, direction = -1) + 
+          scale_x_continuous(breaks = seq(-150, 0, 10)) +
+          scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+          coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+          facet_rep_wrap(~ dist_park_km_factor))
+  cat("\n")
+}
+```
+
+## Sv profiles along the distance gradient
+
+I define a peak in backscatter as a S~V~ value greater than -80 dB re 1 m^-1^ followed by a dip in S~V~. Within the wind park (0-1 km) the Sv profiles are characterized by two peaks, one close to the surface between 0-40 m depth and one in the lower part of the water column between 60-120 m depth. These peaks are separated by a zone of low backscatter between 40-60 m depth.
+
+```{r Sv-layers-all-dist, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 5)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) + 
+  facet_wrap(~ dist_park_km_factor)
+```
+
+### Bimodal distribution of S~V~ {.tabset}
+
+Ideally a cluster analysis of the Sv profiles should be performed for less subjective grouping. **Click on all tabs to get a description of the patterns.**
+
+#### 0-1 km
+
+Surface and bottom Sv peaks observed in 77 % of transects (10 of 13).
+
+```{r Sv-layers-0-1km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(0,1]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 1-2 km
+
+Surface and bottom Sv peaks observed in 54 % of transects (13 of 24).
+
+```{r Sv-layers-1-2km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(1,2]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 2-3 km
+
+Surface and bottom Sv peaks observed in 53 % of transects (16 of 30).
+
+```{r Sv-layers-2-3km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(2,3]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 3-4 km
+
+Surface and bottom Sv peaks observed in 50 % of transects (13 of 26).
+
+```{r Sv-layers-3-4km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(3,4]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 4-5 km
+
+Surface and bottom Sv peaks observed in 34 % of transects (10 of 29).
+
+```{r Sv-layers-4-5km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(4,5]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 5-6 km
+
+Surface and bottom Sv peaks observed in 58 % of transects (7 of 12). Some transects in this one like `T07-2` and `T08-1` were collected in shallower waters and could eventually be considered having two S~V~ peaks, although they do not match the depth definitions (0-40 m and 60-120 m). For now, I have **not** included those transects in the percentage.
+
+```{r Sv-layers-5-6km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(5,6]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+
+#### 6-7 km
+
+Surface and bottom Sv peaks observed in 44 % of transects (4 of 9).
+
+```{r Sv-layers-6-7km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(6,7]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect)
+```
+
+#### 7-8 km
+
+Surface and bottom Sv peaks observed in 0 % of transects (0 of 2).
+
+```{r Sv-layers-7-8km-facet, fig.width=9}
+SB_day_depth_transect %>% 
+  mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                             depth > 40 & depth <= 60 ~ "Mid water dip",
+                             depth > 60 ~ "Bottom peak")) %>% 
+  filter(dist_park_km_factor == "(7,8]") %>%
+  ggplot() + 
+  geom_vline(xintercept = -80, lty = 2) + 
+  geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+  geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+  scale_color_discrete("Acoustic feature") + 
+  scale_x_continuous(breaks = seq(-150, 0, 10)) +
+  scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+  coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+  facet_wrap(~ transect) 
+```
+
+### Vertical distribution of S~V~ along distance transect {.tabset}
+
+We observed at least three changes in the vertical distribution of the backscatter along the distance gradient.
+
+- 1. Increased occupancy of mid-water further with increasing distance from the windpark: e.g., transects `T05-2`, `T14-2`, `T16-2`, and `T20-1`.
+- 2. Increase in surface peak backscatter with increasing distance from the windpark: e.g., transects `T03-2`, `T11-2`, `T12-1`, `T13-1`, and `T21-1`.
+- 3. Decrease in bottom peak backscatter with increasing distance from the windpark: e.g., transects `T11-1`, `T11-2`, and `T14-2`.
+
+```{r Sv-profile-facet-transect, echo=FALSE, fig.width=9, fig.height=5, results='asis'}
+# Loop to create taps with Sv profiles
+for(tab in sort(unique(SB_day_depth_transect$transect))) {
+  # Tabs
+  cat("\n")
+  cat("#### ", tab, "   \n")
+  cat("\n")
+  # Create Sv profile plot per transect per distance category
+  print(SB_day_depth_transect %>% 
+          mutate(feature = case_when(depth <= 40 ~ "Surface peak",
+                                     depth > 40 & depth <= 60 ~ "Mid water dip",
+                                     depth > 60 ~ "Bottom peak")) %>%
+          filter(transect == tab) %>%
+          complete(dist_park_km_factor, depth, fill = list(Sv_mean = -999, feature = "Surface peak")) %>% 
+          ggplot() +
+          geom_vline(xintercept = -80, lty = 2) + 
+          geom_point(aes(x = Sv_mean, y = depth, group = ID, color = feature)) +
+          geom_path(aes(x = Sv_mean, y = depth, group = ID, color = feature), alpha = 0.25) +
+          scale_color_discrete("Acoustic feature") + 
+          scale_x_continuous(breaks = seq(-150, 0, 10)) +
+          scale_y_reverse("depth (m)", breaks = seq(0, 120, 20)) +
+          coord_cartesian(xlim = c(-82, -50), ylim = c(115, 0)) +
+          facet_grid(~ dist_park_km_factor) + 
+          # ggtitle(tab) +
+          theme(legend.position = "top"))
+  cat("\n")
+}
+```
+
+## Summary S~V~ profiles
+
+The change in centre of mass was related to changes in the vertical distribution along the distance gradient. The underlying cause of this change in the vertical distribution could not be assessed but can be related to:
+
+- Attraction to the windpark due to enhanced habitat
+- Avoidance of the windpark due to worsen habitat 
+- Changes in taxonomic composition through different predator-prey interaction affecting vertical distribution or through species-specific backscattering characteristics. This specific point cannot be assessed with our data.
+
+What we observed is most likely a combination of the three factors. 
